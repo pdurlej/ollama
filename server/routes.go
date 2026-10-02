@@ -894,6 +894,13 @@ func (s *Server) SystemOneHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	temperatures := map[string]float64{}
+	for _, typ := range []string{"choice", "noul", "score"} {
+		if t := m.metadata.Float("decision.temperature." + typ); t > 0 {
+			temperatures[typ] = t
+		}
+	}
+	compiled.SetTemperatures(temperatures)
 	caps := []model.Capability{model.CapabilityDecision}
 	if len(req.Images) > 0 {
 		caps = append(caps, model.CapabilityVision)

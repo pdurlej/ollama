@@ -25,6 +25,17 @@ type Compiled struct {
 	Request  llm.ScoreRequest
 	fields   []compiledField
 	messages [][]api.Message
+	// orders is 2 when each question is scored in its original and reversed
+	// option order (rows 2i and 2i+1); Answer averages the two.
+	orders int
+	// temperature calibrates the probabilities of a question type: p ∝ p^(1/T).
+	temperature map[string]float64
+}
+
+// SetTemperatures sets per-type calibration temperatures (choice, noul, score),
+// for example from the model's decision.temperature.* metadata.
+func (c *Compiled) SetTemperatures(t map[string]float64) {
+	c.temperature = t
 }
 
 // Compile validates the request and prepares candidate scoring for Nimble and Tev.
@@ -52,6 +63,12 @@ func CompileWithEncoder(req Request, encoding string) (*Compiled, error) {
 	case "clef":
 		c := &Compiled{}
 		if err := encodeClef(req, c); err != nil {
+			return nil, err
+		}
+		return c, nil
+	case "basal":
+		c := &Compiled{}
+		if err := encodeBasal(req, c); err != nil {
 			return nil, err
 		}
 		return c, nil
@@ -203,27 +220,34 @@ func compileField(name string, q Question) (compiledField, error) {
 
 func (c *Compiled) Answer(model string, result llm.ScoreResponse) (Response, error) {
 	response := Response{Model: model, Answers: &Answers{}, Usage: Usage{InputTokens: result.InputTokens, OutputTokens: result.OutputTokens}}
-	if len(result.Logits) != len(c.fields) {
-		return response, fmt.Errorf("scorer returned %d rows for %d questions", len(result.Logits), len(c.fields))
+	orders := max(c.orders, 1)
+	if len(result.Logits) != len(c.fields)*orders {
+		return response, fmt.Errorf("scorer returned %d rows, want %d", len(result.Logits), len(c.fields)*orders)
 	}
 	for i, f := range c.fields {
-		logits := result.Logits[i]
-		if len(logits) != len(f.Choices) {
-			return response, fmt.Errorf("scorer returned the wrong number of candidates for %q", f.Name)
-		}
-		peak := slices.Max(logits)
-		p := make([]float64, len(logits))
-		var sum float64
-		for j, logit := range logits {
-			if math.IsNaN(float64(logit)) || math.IsInf(float64(logit), 0) {
-				return response, fmt.Errorf("scorer returned a non-finite logit for %q", f.Name)
+		p := make([]float64, len(f.Choices))
+		for o := range orders {
+			q, err := softmax(result.Logits[i*orders+o], len(f.Choices))
+			if err != nil {
+				return response, fmt.Errorf("%w for %q", err, f.Name)
 			}
-			p[j] = math.Exp(float64(logit) - float64(peak))
-			sum += p[j]
+			for j := range q {
+				k := j
+				if o == 1 { // reversed order: position j holds choice len-1-j
+					k = len(q) - 1 - j
+				}
+				p[k] += q[j] / float64(orders)
+			}
+		}
+		if t := c.temperature[f.typ]; t > 0 && t != 1 {
+			logits := make([]float64, len(p))
+			for j := range p {
+				logits[j] = math.Log(max(p[j], 1e-12)) / t
+			}
+			p = softmax64(logits)
 		}
 		var entropy, score float64
 		for j := range p {
-			p[j] /= sum
 			score += float64(j) * p[j]
 			if p[j] > 0 {
 				entropy -= p[j] * math.Log(p[j])
@@ -253,4 +277,33 @@ func (c *Compiled) Answer(model string, result llm.ScoreResponse) (Response, err
 		}
 	}
 	return response, nil
+}
+
+func softmax(logits []float32, n int) ([]float64, error) {
+	if len(logits) != n {
+		return nil, fmt.Errorf("scorer returned the wrong number of candidates")
+	}
+	x := make([]float64, n)
+	for j, logit := range logits {
+		if math.IsNaN(float64(logit)) || math.IsInf(float64(logit), 0) {
+			return nil, fmt.Errorf("scorer returned a non-finite logit")
+		}
+		x[j] = float64(logit)
+	}
+	return softmax64(x), nil
+}
+
+// softmax64 is numerically stable: it subtracts the maximum before exponentiating.
+func softmax64(x []float64) []float64 {
+	peak := slices.Max(x)
+	p := make([]float64, len(x))
+	var sum float64
+	for j, v := range x {
+		p[j] = math.Exp(v - peak)
+		sum += p[j]
+	}
+	for j := range p {
+		p[j] /= sum
+	}
+	return p
 }
